@@ -46,19 +46,16 @@ IMPORTANT: While you should be as detailed as possible, avoid including sensitiv
 ## Evidence
 
 <!--
-Please provide the following details to help us diagnose the issue:
+Please share any evidence you have collected that helps us understand, reproduce, and triage this bug.
+The combination of this evidence and the steps above should allow us to rapidly identify if this is a new issue, a duplicate, or a configuration problem.
 
-**Environment:**
-- **Hypha Version:** (e.g., `v0.1.0`, `git rev-parse HEAD`)
-- **OS/Platform:** (e.g., Ubuntu 22.04, macOS Sonoma, Windows 11)
-- **Deployment:** (e.g., Local binary, Docker, Kubernetes, AWS)
+We welcome any context you can provide. This is not a strict checklist, but helpful examples include:
+- **Logs:** (Tip: `RUST_LOG=debug` often captures the right level of detail)
+- **Environment:** OS, Hypha version, deployment type (Local, Docker, Cloud).
+- **Visuals:** Screenshots, recordings, or diagrams.
+- **Diagnostics:** Output from `hypha-inspect lookup` or `probe`.
 
-**Logs & Context:**
-- Attach relevant logs. **Tip:** Run with `RUST_LOG=debug` or `RUST_LOG=hypha_worker=trace` to capture actionable details.
-- If this is a connectivity issue, include output from:
-  - `hypha-inspect lookup <peer-id>`
-  - `hypha-inspect probe <address>`
-- Screenshots or architectural diagrams if relevant.
+Feel free to share whatever helps us see what you see!
 -->
 
 ```log
