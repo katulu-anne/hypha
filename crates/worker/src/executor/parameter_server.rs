@@ -11,7 +11,10 @@ use candle_core::{
     safetensors::{Load, MmapedSafetensors},
 };
 use futures_util::{StreamExt, TryStreamExt};
-use hypha_messages::{Executor, progress};
+use hypha_messages::{
+    Executor,
+    action::{self, ExecutorStatus},
+};
 use libp2p::PeerId;
 use safetensors::serialize_to_file;
 use sha2::{Digest, Sha256};
@@ -260,12 +263,14 @@ impl JobExecutor for ParameterServerExecutor {
                         Retry::spawn(retry_strategy.clone(), || {
                             let network = network.clone();
                             async move {
-                                hypha_network::request_response::RequestResponseInterface::<progress::Codec>::request(
+                                hypha_network::request_response::RequestResponseInterface::<action::Codec>::request(
                                     &network,
                                     scheduler_id,
-                                    progress::Request{
+                                    action::ActionRequest{
                                         job_id,
-                                        progress: progress::Progress::Updated,
+                                        status: ExecutorStatus::Aggregate(
+                                            action::AggregateStatus::BroadcastedUpdate { metrics: None },
+                                        ),
                                     }
                                 )
                                 .await

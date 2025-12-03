@@ -1,9 +1,9 @@
 import argparse
-import datetime
 import json
 import os
+import time
+from typing import Optional
 
-import numpy as np
 import torch
 import torch.utils.data
 from accelerate import Accelerator
@@ -64,52 +64,43 @@ def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR09
         training_data_iter = dataset_wrapper(training_dataloader)
 
         epoch_counter = 1
-        # Start receiver immediately, but do not consume until we've sent once
+        job_id = job_spec["job_id"]
+        MIN_LOOP_TIME_MS = 100
+        last_gradient: Optional[str] = None
+        last_metrics: dict[str, float] = {}
+
         with session.receive(config["results"], "incoming") as receiver:
             updates_iter = iter(receiver)
-            await_update = False
+
+            current_status = {
+                "executor": "train",
+                "details": {"state": "idle"},
+            }
 
             while True:
-                start_time = datetime.datetime.now()
+                loop_start_ms = time.time() * 1000.0
+                action_resp = session.send_action({"job_id": job_id, "status": current_status})
+                next_action = action_resp.get("next", {})
 
-                if await_update:
-                    print("Waiting for model update", flush=True)
-                    try:
-                        pointers = next(updates_iter)
-                        if pointers:
-                            try:
-                                latest = pointers[-1] if isinstance(pointers, list) else pointers
-                                parameters = (
-                                    latest.get("parameters") if isinstance(latest.get("parameters"), dict) else None
-                                )
-                                rel_path = parameters.get("path") if parameters else latest.get("path")
-                                if isinstance(rel_path, str):
-                                    path = os.path.join(work_dir, rel_path)
-                                    # Load new model with outer gradients
-                                    model.load_state_dict(merge_models(previous_model_path, path))
-                                    # over write previous model
-                                    response = session.send_status("update-received")
-                                    if response["type"] == "Done":
-                                        print("Training finished")
-                                        break
-                                    if response["type"] == "PushToHF":
-                                        model.push_to_hub(response["repository"], token=response["token"])
-                                        print("Model pushed. Traning finished")
-                                        break
+                if next_action.get("executor") != "train":
+                    raise RuntimeError(f"Unexpected executor action: {next_action}")
 
-                                    save_model(model, previous_model_path)
-                                    model = accelerator.prepare(model)
-                                    print("Weights updated from", rel_path, flush=True)
-                            except Exception as e:
-                                print(f"pointer handling error: {e}")
-                    except StopIteration:
-                        print("Receiver stream closed; no updates to merge.")
-                    finally:
-                        await_update = False
+                action = next_action.get("action", {})
+                kind = action.get("kind")
 
-                losses = []
-                counter = -1
-                while counter != 0:
+                if kind == "terminate":
+                    print("Training finished", flush=True)
+                    break
+
+                if kind == "idle":
+                    timeout = action.get("timeout")
+                    if timeout is not None:
+                        now_ms = time.time() * 1000.0
+                        delta_ms = max(0, int(timeout / 1_000_000) - int(now_ms))
+                        if delta_ms > 0:
+                            time.sleep(delta_ms / 1000.0)
+                    current_status = {"executor": "train", "details": {"state": "idle"}}
+                elif kind == "execute-batch":
                     batch = next(training_data_iter)
                     optimizer.zero_grad()
                     outputs = model(**batch)
@@ -117,45 +108,60 @@ def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR09
                     accelerator.backward(loss)
                     optimizer.step()
                     scheduler.step()
-                    losses.append(loss.detach().cpu().numpy())
                     if accelerator.is_main_process:
-                        round_time = start_time - datetime.datetime.now()
-                        response = session.send_status(
-                            {
-                                "status": {
-                                    "batch_size": next(iter(batch.values())).shape[0],
-                                    "round_time": int(round_time.microseconds / 1000),
-                                }
-                            }
-                        )
-                        if response["type"] == "ScheduleUpdate":
-                            counter = response["counter"]
-                        else:
-                            counter -= 1
-                        start_time = datetime.datetime.now()
+                        batch_size = next(iter(batch.values())).shape[0]
+                        current_status = {
+                            "executor": "train",
+                            "details": {"state": "batch-completed", "batch_size": batch_size},
+                        }
+                        # Prepare gradients for potential SendUpdate
+                        file_name = f"{epoch_counter}_local_gradients.pt"
+                        result_path = os.path.join(work_dir, file_name)
+                        model_cpu = accelerator.unwrap_model(model)
+                        model_cpu.to("cpu")
+                        save_file(extract_gradients(model_cpu.state_dict(), previous_model_path), result_path)
+                        last_gradient = file_name
+                        last_metrics = {"loss": float(loss.detach().cpu().numpy())}
+                    else:
+                        current_status = {
+                            "executor": "train",
+                            "details": {"state": "batch-completed", "batch_size": 0},
+                        }
+                elif kind == "send-update":
+                    if last_gradient is None:
+                        raise RuntimeError("SendUpdate requested but no gradients available")
+                    session.send_resource(config["updates"], last_gradient)
+                    current_status = {"executor": "train", "details": {"state": "sent-update"}}
+                elif kind == "apply-update":
+                    try:
+                        pointers = next(updates_iter)
+                        if pointers:
+                            latest = pointers[-1] if isinstance(pointers, list) else pointers
+                            parameters = (
+                                latest.get("parameters") if isinstance(latest.get("parameters"), dict) else None
+                            )
+                            rel_path = parameters.get("path") if parameters else latest.get("path")
+                            if isinstance(rel_path, str):
+                                path = os.path.join(work_dir, rel_path)
+                                model.load_state_dict(merge_models(previous_model_path, path))
+                                save_model(model, previous_model_path)
+                                model = accelerator.prepare(model)
+                    except StopIteration:
+                        print("Receiver stream closed; no updates to merge.")
 
-                if accelerator.is_main_process:
-                    session.send_status("update")
-                    # For testing purposes set to global!
-                    file_name = f"{epoch_counter}_local_gradients.pt"
-                    result_path = os.path.join(work_dir, file_name)
-                    # Save unwrapped model to avoid accelerator wrappers interfering
-                    model = accelerator.unwrap_model(model)
-                    # All weights need to be on CPU
-                    model.to("cpu")
-
-                    save_file(extract_gradients(model.state_dict(), previous_model_path), result_path)
-                    session.send_resource(config["updates"], file_name)
-
-                    # Mark that before the next training epoch we must wait for an update
-                    await_update = True
-
-                    session.send_status(
-                        {"metrics": {"round": epoch_counter, "metrics": {"loss": float(np.mean(losses))}}}
-                    )
+                    current_status = {
+                        "executor": "train",
+                        "details": {"state": "applied-update", "round": epoch_counter, "metrics": last_metrics},
+                    }
                     epoch_counter += 1
+                else:
+                    raise RuntimeError(f"Unhandled action kind: {kind}")
 
-            print(f"Finished training of {epoch_counter - 1} DiLoCo update rounds", flush=True)
+                elapsed = time.time() * 1000.0 - loop_start_ms
+                if elapsed < MIN_LOOP_TIME_MS:
+                    time.sleep((MIN_LOOP_TIME_MS - elapsed) / 1000.0)
+
+        print(f"Finished training of {epoch_counter - 1} DiLoCo update rounds", flush=True)
 
 
 if __name__ == "__main__":

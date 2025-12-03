@@ -27,7 +27,7 @@ impl Task {
     pub async fn try_new(
         network: Network,
         job_spec: JobSpec,
-        workers: &[&Worker],
+        workers: &[PeerId],
     ) -> Result<Self, WorkerError> {
         let (tx, rx) = mpsc::channel(100);
 
@@ -67,13 +67,14 @@ impl Task {
                 }),
         );
 
-        let dispatch_futures = workers.iter().map(|worker| {
+        let dispatch_futures = workers.iter().map(|peer_id| {
             let network = network.clone();
             let job_spec = job_spec.clone();
+            let peer_id = *peer_id;
             async move {
                 match network
                     .request::<api::Codec>(
-                        worker.peer_id(),
+                        peer_id,
                         api::Request::DispatchJob(dispatch_job::Request {
                             id,
                             spec: job_spec.clone(),
