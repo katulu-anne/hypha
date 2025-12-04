@@ -10,10 +10,7 @@ use libp2p::PeerId;
 use tokio::{sync::mpsc, task::JoinHandle};
 use uuid::Uuid;
 
-use crate::{
-    network::Network,
-    worker::{Worker, WorkerError},
-};
+use crate::{network::Network, worker::WorkerError};
 
 /// A task represents a task as it is being executed by one or multiple nodes.
 /// During its lifetime, it provides a stream of status updates for the task, sent by these nodes.

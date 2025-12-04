@@ -402,6 +402,10 @@ async fn receive_subscribe(
         };
         let mut index = 0usize;
         while let Some(item_result) = tokio::select! {
+            _ = tx.closed() => {
+                tracing::debug!(path = %dir_rel_clone, "receive_subscribe: client stream dropped");
+                None
+            }
             _ = cancel.cancelled() => {
                 tracing::debug!(path = %dir_rel_clone, "receive_subscribe: task cancelled");
                 None

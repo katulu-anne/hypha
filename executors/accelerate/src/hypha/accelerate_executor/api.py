@@ -31,14 +31,14 @@ class Session(AbstractContextManager["Session", None]):
         return resp.json()
 
     @contextmanager
-    def receive(self, resource: Any, path: str) -> Iterator["EventSource"]:
+    def receive(self, resource: Any, path: str, timeout: float | None = None) -> Iterator["EventSource"]:
         req = {"resource": resource, "path": path}
         with self._client.stream(
             "POST",
             "http://hypha/resources/receive",
             json=req,
             headers={"Accept": "text/event-stream"},
-            timeout=None,  # block indefinitely for SSE updates
+            timeout=timeout,
         ) as resp:
             yield EventSource(resp)
 

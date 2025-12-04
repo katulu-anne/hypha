@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime};
 use hypha_messages::{
     Reference, SelectionStrategy,
     action::{
-        self, AggregateAction, AggregateStatus, ExecutorAction, ExecutorStatus, TrainAction,
-        TrainStatus,
+        self, AggregateAction, AggregateError, AggregateStatus, ExecutorAction, ExecutorStatus,
+        TrainAction, TrainError, TrainStatus,
     },
     progress::Metrics,
 };
@@ -55,31 +55,52 @@ where
     tracing::debug!(%peer_id, ?status, %job_id, "Received action request");
 
     let now = SystemTime::now();
-    let deadline = now + Duration::from_secs(5);
+
     let since_start = start.elapsed().as_millis() as u64;
+    let parameter_servers: Vec<PeerId> =
+        parameter_pool.members().iter().map(|w| w.peer_id).collect();
 
     let response = match status {
         ExecutorStatus::Train(train) => match train {
             TrainStatus::Idle => ExecutorAction::Train(TrainAction::ExecuteBatch),
             TrainStatus::BatchCompleted { .. } => {
                 worker_pool.update(&peer_id, since_start);
+                if parameter_servers.is_empty() {
+                    return Ok(action::ActionResponse {
+                        job_id,
+                        next: ExecutorAction::Train(TrainAction::Idle {
+                            timeout: now + Duration::from_secs(1),
+                        }),
+                    });
+                }
+
                 ExecutorAction::Train(TrainAction::SendUpdate {
                     target: Reference::Peers {
-                        peers: parameter_pool.members().iter().map(|w| w.peer_id).collect(),
-                        strategy: SelectionStrategy::All,
+                        // Selecting a single PS to avoid that workers send updates to multiple PS
+                        peers: vec![parameter_servers[0]],
+                        strategy: SelectionStrategy::One,
                         resource: None,
                     },
-                    timeout: deadline,
+                    // TODO: We need a way to properly determine a good sent timeout
+                    timeout: now + Duration::from_mins(5),
                 })
             }
-            TrainStatus::SentUpdate => ExecutorAction::Train(TrainAction::ApplyUpdate {
-                source: Reference::Peers {
-                    peers: parameter_pool.members().iter().map(|w| w.peer_id).collect(),
-                    strategy: SelectionStrategy::All,
-                    resource: None,
-                },
-                timeout: deadline,
-            }),
+            TrainStatus::SentUpdate => {
+                if parameter_servers.is_empty() {
+                    ExecutorAction::Train(TrainAction::Idle {
+                        timeout: now + Duration::from_secs(1),
+                    })
+                } else {
+                    ExecutorAction::Train(TrainAction::ApplyUpdate {
+                        source: Reference::Peers {
+                            peers: parameter_servers,
+                            strategy: SelectionStrategy::All,
+                            resource: None,
+                        },
+                        timeout: now + Duration::from_mins(5),
+                    })
+                }
+            }
             TrainStatus::AppliedUpdate { round, metrics } => {
                 tx.send((peer_id, Metrics { round, metrics }))
                     .await
@@ -87,36 +108,60 @@ where
 
                 ExecutorAction::Train(TrainAction::ExecuteBatch)
             }
-            TrainStatus::Terminated => ExecutorAction::Train(TrainAction::Terminate),
-            TrainStatus::Error(msg) => {
-                tracing::warn!(%peer_id, error = %msg, "Worker reported error");
+            TrainStatus::Error(TrainError::Connection { message }) => {
+                tracing::warn!(%peer_id, message = %message, "Worker reported connection error");
+                ExecutorAction::Train(TrainAction::Idle {
+                    timeout: now + Duration::from_secs(1),
+                })
+            }
+            TrainStatus::Error(TrainError::Other { message }) => {
+                tracing::warn!(%peer_id, message = %message, "Worker reported error");
                 ExecutorAction::Train(TrainAction::Terminate)
             }
+            TrainStatus::Terminated => ExecutorAction::Train(TrainAction::Terminate),
         },
         ExecutorStatus::Aggregate(state) => match state {
-            AggregateStatus::Idle => ExecutorAction::Aggregate(AggregateAction::AggregateUpdates {
-                source: Reference::Peers {
-                    peers: worker_pool
-                        .statistics()
-                        .into_iter()
-                        .map(|w| w.peer_id)
-                        .collect(),
-                    strategy: SelectionStrategy::All,
-                    resource: None,
-                },
-            }),
+            AggregateStatus::Idle => {
+                let workers: Vec<_> = worker_pool
+                    .statistics()
+                    .into_iter()
+                    .map(|w| w.peer_id)
+                    .collect();
+
+                if workers.is_empty() {
+                    ExecutorAction::Aggregate(AggregateAction::Idle {
+                        timeout: now + Duration::from_secs(1),
+                    })
+                } else {
+                    ExecutorAction::Aggregate(AggregateAction::AggregateUpdates {
+                        source: Reference::Peers {
+                            peers: workers,
+                            strategy: SelectionStrategy::All,
+                            resource: None,
+                        },
+                    })
+                }
+            }
             AggregateStatus::AggregatedUpdates { .. } => {
-                ExecutorAction::Aggregate(AggregateAction::BroadcastUpdate {
-                    target: Reference::Peers {
-                        peers: worker_pool
-                            .statistics()
-                            .into_iter()
-                            .map(|w| w.peer_id)
-                            .collect(),
-                        strategy: SelectionStrategy::All,
-                        resource: None,
-                    },
-                })
+                let workers: Vec<_> = worker_pool
+                    .statistics()
+                    .into_iter()
+                    .map(|w| w.peer_id)
+                    .collect();
+
+                if workers.is_empty() {
+                    ExecutorAction::Aggregate(AggregateAction::Idle {
+                        timeout: now + Duration::from_secs(1),
+                    })
+                } else {
+                    ExecutorAction::Aggregate(AggregateAction::BroadcastUpdate {
+                        target: Reference::Peers {
+                            peers: workers,
+                            strategy: SelectionStrategy::All,
+                            resource: None,
+                        },
+                    })
+                }
             }
             AggregateStatus::BroadcastedUpdate { metrics } => {
                 if let Some(metrics) = metrics {
@@ -125,15 +170,26 @@ where
                         .map_err(BatchSchedulerError::from)?;
                 }
 
-                ExecutorAction::Aggregate(AggregateAction::Idle { timeout: deadline })
+                ExecutorAction::Aggregate(AggregateAction::Idle {
+                    timeout: now + Duration::from_secs(1),
+                })
             }
-            AggregateStatus::Terminated => ExecutorAction::Aggregate(AggregateAction::Terminate),
-            AggregateStatus::Error(msg) => {
-                tracing::warn!(%peer_id, error = %msg, "Aggregator reported error");
+            AggregateStatus::Error(AggregateError::Connection { message }) => {
+                tracing::warn!(%peer_id, message = %message, "Aggregator reported connection error");
+                ExecutorAction::Aggregate(AggregateAction::Idle {
+                    timeout: now + Duration::from_secs(1),
+                })
+            }
+            AggregateStatus::Error(AggregateError::Other { message }) => {
+                tracing::warn!(%peer_id, message = %message, "Aggregator reported error");
                 ExecutorAction::Aggregate(AggregateAction::Terminate)
             }
+
+            AggregateStatus::Terminated => ExecutorAction::Aggregate(AggregateAction::Terminate),
         },
     };
+
+    tracing::debug!(%peer_id, %job_id, response = ?response, "Sending action response");
 
     Ok(action::ActionResponse {
         job_id,
@@ -289,6 +345,63 @@ mod batch_scheduler_tests {
 
         match resp.next {
             hypha_messages::action::ExecutorAction::Train(TrainAction::ExecuteBatch) => {}
+            other => panic!("Unexpected response: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn train_waits_without_parameter_server() {
+        let pool = Pool::new(
+            NoopAllocator,
+            PoolConfig {
+                name: "test".into(),
+                spec: hypha_messages::WorkerSpec {
+                    resources: Resources::default(),
+                    executor: vec![],
+                },
+                price: PriceRange::default(),
+                min: 0,
+                target: 0,
+                grace: Duration::from_secs(1),
+            },
+        );
+        let worker_pool = PoolWithStatistics::<RunningMean>::new(pool);
+        let worker_handle = worker_pool.handle();
+        let ps_pool = Pool::new(
+            NoopAllocator,
+            PoolConfig {
+                name: "ps".into(),
+                spec: hypha_messages::WorkerSpec {
+                    resources: Resources::default(),
+                    executor: vec![],
+                },
+                price: PriceRange::default(),
+                min: 0,
+                target: 0,
+                grace: Duration::from_secs(1),
+            },
+        );
+        let parameter_pool = ps_pool.handle();
+
+        let (tx, _rx) = tokio::sync::mpsc::channel::<(PeerId, Metrics)>(1);
+        let resp = schedule::<RunningMean, BasicSimulation>(
+            tx,
+            worker_handle,
+            parameter_pool,
+            std::time::Instant::now(),
+            (
+                PeerId::random(),
+                ActionRequest {
+                    job_id: Uuid::new_v4(),
+                    status: ExecutorStatus::Train(TrainStatus::BatchCompleted { batch_size: 4 }),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+        match resp.next {
+            hypha_messages::action::ExecutorAction::Train(TrainAction::Idle { .. }) => {}
             other => panic!("Unexpected response: {:?}", other),
         }
     }

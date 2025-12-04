@@ -104,7 +104,7 @@ pub mod action {
             metrics: HashMap<String, f32>,
         },
         Terminated,
-        Error(String),
+        Error(TrainError),
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -118,7 +118,21 @@ pub mod action {
             metrics: Option<HashMap<String, f32>>,
         },
         Terminated,
-        Error(String),
+        Error(AggregateError),
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "kebab-case")]
+    pub enum TrainError {
+        Connection { message: String },
+        Other { message: String },
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "kebab-case")]
+    pub enum AggregateError {
+        Connection { message: String },
+        Other { message: String },
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]

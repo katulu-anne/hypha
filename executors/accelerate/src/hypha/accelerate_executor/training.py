@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+import uuid
 from typing import Optional
 
 import torch
@@ -23,6 +24,24 @@ from .utils import (
 )
 
 FETCH_PATH = "artifacts"
+
+
+def system_time_to_epoch_ms(timeout: object) -> Optional[int]:
+    if isinstance(timeout, dict):
+        secs = timeout.get("secs_since_epoch")
+        nanos = timeout.get("nanos_since_epoch", 0)
+        if secs is not None:
+            return int(secs * 1000 + int(nanos / 1_000_000))
+    if isinstance(timeout, (int, float)):
+        # Fallback for numeric nanos representation.
+        return int(timeout / 1_000_000)
+    return None
+
+
+def sleep_until_epoch_ms(target_ms: int) -> None:
+    now_ms = int(time.time() * 1000.0)
+    if target_ms > now_ms:
+        time.sleep((target_ms - now_ms) / 1000.0)
 
 
 def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR0915, PLR0912
@@ -69,71 +88,126 @@ def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR09
         last_gradient: Optional[str] = None
         last_metrics: dict[str, float] = {}
 
-        with session.receive(config["results"], "incoming") as receiver:
-            updates_iter = iter(receiver)
+        current_status = {
+            "executor": "train",
+            "details": {"state": "idle"},
+        }
 
-            current_status = {
-                "executor": "train",
-                "details": {"state": "idle"},
-            }
+        while True:
+            loop_start_ms = time.time() * 1000.0
+            action_resp = session.send_action({"job_id": job_id, "status": current_status})
+            next_action = action_resp.get("next", {})
 
-            while True:
-                loop_start_ms = time.time() * 1000.0
-                action_resp = session.send_action({"job_id": job_id, "status": current_status})
-                next_action = action_resp.get("next", {})
+            if next_action.get("executor") != "train":
+                raise RuntimeError(f"Unexpected executor action: {next_action}")
 
-                if next_action.get("executor") != "train":
-                    raise RuntimeError(f"Unexpected executor action: {next_action}")
+            action = next_action.get("action", {})
+            kind = action.get("kind")
 
-                action = next_action.get("action", {})
-                kind = action.get("kind")
+            if kind == "terminate":
+                print("Training finished", flush=True)
+                break
 
-                if kind == "terminate":
-                    print("Training finished", flush=True)
-                    break
+            if kind == "idle":
+                timeout_ms = system_time_to_epoch_ms(action.get("timeout"))
+                if timeout_ms is not None:
+                    sleep_until_epoch_ms(timeout_ms)
+                current_status = {"executor": "train", "details": {"state": "idle"}}
+            elif kind == "execute-batch":
+                batch = next(training_data_iter)
+                optimizer.zero_grad()
+                outputs = model(**batch)
+                loss = outputs if isinstance(outputs, torch.Tensor) else outputs["loss"]
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
+                if accelerator.is_main_process:
+                    batch_size = next(iter(batch.values())).shape[0]
+                    current_status = {
+                        "executor": "train",
+                        "details": {"state": "batch-completed", "batch_size": batch_size},
+                    }
+                    # Prepare gradients for potential SendUpdate
+                    file_name = f"{epoch_counter}_local_gradients.pt"
+                    result_path = os.path.join(work_dir, file_name)
+                    # Copy weights to CPU without moving the live model off-device.
+                    model_state = accelerator.unwrap_model(model).state_dict()
+                    state_cpu = {k: v.detach().cpu() for k, v in model_state.items()}
+                    save_file(extract_gradients(state_cpu, previous_model_path), result_path)
+                    last_gradient = file_name
+                    last_metrics = {"loss": float(loss.detach().cpu().numpy())}
+                else:
+                    current_status = {
+                        "executor": "train",
+                        "details": {"state": "batch-completed", "batch_size": 0},
+                    }
+            elif kind == "send-update":
+                if last_gradient is None:
+                    current_status = {
+                        "executor": "train",
+                        "details": {
+                            "state": "error",
+                            "type": "other",
+                            "message": "SendUpdate requested but no gradients available",
+                        },
+                    }
+                    continue
 
-                if kind == "idle":
-                    timeout = action.get("timeout")
-                    if timeout is not None:
-                        now_ms = time.time() * 1000.0
-                        delta_ms = max(0, int(timeout / 1_000_000) - int(now_ms))
-                        if delta_ms > 0:
-                            time.sleep(delta_ms / 1000.0)
-                    current_status = {"executor": "train", "details": {"state": "idle"}}
-                elif kind == "execute-batch":
-                    batch = next(training_data_iter)
-                    optimizer.zero_grad()
-                    outputs = model(**batch)
-                    loss = outputs if isinstance(outputs, torch.Tensor) else outputs["loss"]
-                    accelerator.backward(loss)
-                    optimizer.step()
-                    scheduler.step()
-                    if accelerator.is_main_process:
-                        batch_size = next(iter(batch.values())).shape[0]
-                        current_status = {
-                            "executor": "train",
-                            "details": {"state": "batch-completed", "batch_size": batch_size},
-                        }
-                        # Prepare gradients for potential SendUpdate
-                        file_name = f"{epoch_counter}_local_gradients.pt"
-                        result_path = os.path.join(work_dir, file_name)
-                        model_cpu = accelerator.unwrap_model(model)
-                        model_cpu.to("cpu")
-                        save_file(extract_gradients(model_cpu.state_dict(), previous_model_path), result_path)
-                        last_gradient = file_name
-                        last_metrics = {"loss": float(loss.detach().cpu().numpy())}
-                    else:
-                        current_status = {
-                            "executor": "train",
-                            "details": {"state": "batch-completed", "batch_size": 0},
-                        }
-                elif kind == "send-update":
-                    if last_gradient is None:
-                        raise RuntimeError("SendUpdate requested but no gradients available")
-                    session.send_resource(config["updates"], last_gradient)
+                target = action.get("target")
+                if target is None:
+                    current_status = {
+                        "executor": "train",
+                        "details": {
+                            "state": "error",
+                            "type": "other",
+                            "message": "SendUpdate missing target reference",
+                        },
+                    }
+                    continue
+                try:
+                    session.send_resource(target, last_gradient)
                     current_status = {"executor": "train", "details": {"state": "sent-update"}}
-                elif kind == "apply-update":
-                    try:
+                except Exception as exc:  # noqa: BLE001
+                    current_status = {
+                        "executor": "train",
+                        "details": {
+                            "state": "error",
+                            "type": "connection",
+                            "message": str(exc),
+                        },
+                    }
+            elif kind == "apply-update":
+                source = action.get("source")
+                if source is None:
+                    current_status = {
+                        "executor": "train",
+                        "details": {
+                            "state": "error",
+                            "type": "other",
+                            "message": "ApplyUpdate missing source reference",
+                        },
+                    }
+                    continue
+
+                timeout_ms = system_time_to_epoch_ms(action.get("timeout"))
+                read_timeout = (timeout_ms - int(time.time() * 1000.0)) / 1000.0 if timeout_ms else None
+                if read_timeout is not None and read_timeout <= 0:
+                    # Scheduler will tell us what to do next.
+                    current_status = {
+                        "executor": "train",
+                        "details": {
+                            "state": "error",
+                            "type": "connection",
+                            "message": "ApplyUpdate timeout reached before receive",
+                        },
+                    }
+                    continue
+
+                receive_path = f"incoming-{uuid.uuid4()}"
+
+                try:
+                    with session.receive(source, receive_path, timeout=read_timeout) as receiver:
+                        updates_iter = iter(receiver)
                         pointers = next(updates_iter)
                         if pointers:
                             latest = pointers[-1] if isinstance(pointers, list) else pointers
@@ -146,20 +220,38 @@ def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR09
                                 model.load_state_dict(merge_models(previous_model_path, path))
                                 save_model(model, previous_model_path)
                                 model = accelerator.prepare(model)
-                    except StopIteration:
-                        print("Receiver stream closed; no updates to merge.")
-
+                except StopIteration:
                     current_status = {
                         "executor": "train",
-                        "details": {"state": "applied-update", "round": epoch_counter, "metrics": last_metrics},
+                        "details": {
+                            "state": "error",
+                            "type": "connection",
+                            "message": "Receiver stream closed; no updates to merge.",
+                        },
                     }
-                    epoch_counter += 1
-                else:
-                    raise RuntimeError(f"Unhandled action kind: {kind}")
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    current_status = {
+                        "executor": "train",
+                        "details": {
+                            "state": "error",
+                            "type": "connection",
+                            "message": str(exc),
+                        },
+                    }
+                    continue
 
-                elapsed = time.time() * 1000.0 - loop_start_ms
-                if elapsed < MIN_LOOP_TIME_MS:
-                    time.sleep((MIN_LOOP_TIME_MS - elapsed) / 1000.0)
+                current_status = {
+                    "executor": "train",
+                    "details": {"state": "applied-update", "round": epoch_counter, "metrics": last_metrics},
+                }
+                epoch_counter += 1
+            else:
+                raise RuntimeError(f"Unhandled action kind: {kind}")
+
+            elapsed = time.time() * 1000.0 - loop_start_ms
+            if elapsed < MIN_LOOP_TIME_MS:
+                time.sleep((MIN_LOOP_TIME_MS - elapsed) / 1000.0)
 
         print(f"Finished training of {epoch_counter - 1} DiLoCo update rounds", flush=True)
 
