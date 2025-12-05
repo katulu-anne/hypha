@@ -1,4 +1,8 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, SystemTime, Instant},
+};
 
 use hypha_messages::{
     Reference, SelectionStrategy,
@@ -12,7 +16,7 @@ use hypha_network::request_response::{RequestResponseError, RequestResponseInter
 use libp2p::PeerId;
 use thiserror::Error;
 use tokio::{
-    sync::mpsc::{self, Sender, error::SendError},
+    sync::{Mutex, mpsc::{self, Sender, error::SendError}},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -23,6 +27,17 @@ use crate::{
     simulation::Simulation,
     statistics::RuntimeStatistic,
 };
+
+// NOTE: Tracks per-round update signals from workers so the scheduler can
+// decide when to instruct the parameter server to aggregate.
+#[derive(Default)]
+struct RoundState {
+    sent_updates: HashSet<PeerId>,
+    first_update_at: Option<Instant>,
+    min_quorum: usize,
+    grace: Duration,
+    round: u32,
+}
 
 #[derive(Debug, Error)]
 pub enum BatchSchedulerError {
@@ -43,6 +58,7 @@ async fn schedule<T, S>(
     tx: Sender<(PeerId, Metrics)>,
     worker_pool: PoolStatisticsHandle<T>,
     parameter_pool: PoolHandle,
+    round_state: Arc<Mutex<RoundState>>,
     start: std::time::Instant,
     request: (PeerId, action::ActionRequest),
 ) -> Result<action::ActionResponse, BatchSchedulerError>
@@ -57,8 +73,10 @@ where
     let now = SystemTime::now();
 
     let since_start = start.elapsed().as_millis() as u64;
+    // NOTE: We rely on Pool::members() being oldest-first ordered by join time.
     let parameter_servers: Vec<PeerId> =
         parameter_pool.members().iter().map(|w| w.peer_id).collect();
+    let primary_ps = parameter_servers.first().copied();
 
     let response = match status {
         ExecutorStatus::Train(train) => match train {
@@ -82,10 +100,32 @@ where
                         resource: None,
                     },
                     // TODO: We need a way to properly determine a good sent timeout
-                    timeout: now + Duration::from_mins(5),
+                    timeout: now + Duration::from_secs(30),
                 })
             }
             TrainStatus::SentUpdate => {
+                // NOTE: Track workers that have sent their update for the current round.
+                let mut state = round_state.lock().await;
+                state.sent_updates.insert(peer_id);
+                if state.first_update_at.is_none() {
+                    state.first_update_at = Some(Instant::now());
+                }
+                let total_workers = worker_pool.statistics().len();
+                let sent = state.sent_updates.len();
+                let elapsed_ms = state
+                    .first_update_at
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                tracing::info!(
+                    %peer_id,
+                    round = state.round,
+                    sent,
+                    total = total_workers,
+                    min_quorum = state.min_quorum,
+                    grace_ms = state.grace.as_millis() as u64,
+                    since_first_ms = elapsed_ms,
+                    "Worker reported SentUpdate; recorded for round"
+                );
                 if parameter_servers.is_empty() {
                     ExecutorAction::Train(TrainAction::Idle {
                         timeout: now + Duration::from_secs(1),
@@ -97,7 +137,7 @@ where
                             strategy: SelectionStrategy::All,
                             resource: None,
                         },
-                        timeout: now + Duration::from_mins(5),
+                        timeout: now + Duration::from_secs(30),
                     })
                 }
             }
@@ -122,45 +162,115 @@ where
         },
         ExecutorStatus::Aggregate(state) => match state {
             AggregateStatus::Idle => {
-                let workers: Vec<_> = worker_pool
-                    .statistics()
-                    .into_iter()
-                    .map(|w| w.peer_id)
-                    .collect();
-
-                if workers.is_empty() {
+                // Only the primary PS is allowed to aggregate.
+                if Some(peer_id) != primary_ps {
+                    if let Some(primary) = primary_ps {
+                        tracing::debug!(
+                            %peer_id,
+                            primary_ps = %primary,
+                            "Non-primary PS polling; returning Idle"
+                        );
+                    }
                     ExecutorAction::Aggregate(AggregateAction::Idle {
-                        timeout: now + Duration::from_secs(1),
+                        timeout: now + Duration::from_secs(5),
                     })
                 } else {
-                    ExecutorAction::Aggregate(AggregateAction::AggregateUpdates {
-                        source: Reference::Peers {
-                            peers: workers,
-                            strategy: SelectionStrategy::All,
-                            resource: None,
-                        },
-                    })
+                    let workers: Vec<_> = worker_pool
+                        .statistics()
+                        .into_iter()
+                        .map(|w| w.peer_id)
+                        .collect();
+
+                    if workers.is_empty() {
+                        ExecutorAction::Aggregate(AggregateAction::Idle {
+                            timeout: now + Duration::from_secs(1),
+                        })
+                    } else {
+                        // Start aggregation when either all workers have sent updates,
+                        // or when a quorum (min workers) have sent updates and the
+                        // grace period has elapsed since the first update in this round.
+                        let state = round_state.lock().await;
+                        let all_sent = workers
+                            .iter()
+                            .all(|w| state.sent_updates.contains(w));
+                        let effective_quorum = state.min_quorum.min(workers.len());
+                        let quorum_met = state.sent_updates.len() >= effective_quorum;
+                        let timebox_elapsed = state
+                            .first_update_at
+                            .map(|t| t.elapsed() >= state.grace)
+                            .unwrap_or(false);
+                        let ready = all_sent || (quorum_met && timebox_elapsed);
+                        let reason = if all_sent {
+                            "all_sent"
+                        } else if quorum_met && timebox_elapsed {
+                            "quorum_and_grace"
+                        } else if quorum_met {
+                            "quorum_met_waiting_grace"
+                        } else {
+                            "waiting_quorum"
+                        };
+                        tracing::info!(
+                            round = state.round,
+                            workers = workers.len(),
+                            sent = state.sent_updates.len(),
+                            min_quorum = state.min_quorum,
+                            effective_quorum,
+                            grace_ms = state.grace.as_millis() as u64,
+                            since_first_ms = state
+                                .first_update_at
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(0),
+                            ready,
+                            reason,
+                            "Aggregation readiness evaluation"
+                        );
+
+                        if ready {
+                            tracing::info!(round = state.round, "Trigger AggregateUpdates");
+                            ExecutorAction::Aggregate(AggregateAction::AggregateUpdates {
+                                source: Reference::Peers {
+                                    peers: workers,
+                                    strategy: SelectionStrategy::All,
+                                    resource: None,
+                                },
+                            })
+                        } else {
+                            ExecutorAction::Aggregate(AggregateAction::Idle {
+                                timeout: now + Duration::from_millis(500),
+                            })
+                        }
+                    }
                 }
             }
             AggregateStatus::AggregatedUpdates { .. } => {
-                let workers: Vec<_> = worker_pool
-                    .statistics()
-                    .into_iter()
-                    .map(|w| w.peer_id)
-                    .collect();
-
-                if workers.is_empty() {
+                // Only allow the primary PS to proceed to broadcast.
+                if Some(peer_id) != primary_ps {
                     ExecutorAction::Aggregate(AggregateAction::Idle {
-                        timeout: now + Duration::from_secs(1),
+                        timeout: now + Duration::from_secs(5),
                     })
                 } else {
-                    ExecutorAction::Aggregate(AggregateAction::BroadcastUpdate {
-                        target: Reference::Peers {
-                            peers: workers,
-                            strategy: SelectionStrategy::All,
-                            resource: None,
-                        },
-                    })
+                    let workers: Vec<_> = worker_pool
+                        .statistics()
+                        .into_iter()
+                        .map(|w| w.peer_id)
+                        .collect();
+
+                    if workers.is_empty() {
+                        ExecutorAction::Aggregate(AggregateAction::Idle {
+                            timeout: now + Duration::from_secs(1),
+                        })
+                    } else {
+                        // Log that we are moving to broadcast for this round.
+                        let state = round_state.lock().await;
+                        tracing::info!(round = state.round, "Trigger BroadcastUpdate");
+                        ExecutorAction::Aggregate(AggregateAction::BroadcastUpdate {
+                            target: Reference::Peers {
+                                peers: workers,
+                                strategy: SelectionStrategy::All,
+                                resource: None,
+                            },
+                        })
+                    }
                 }
             }
             AggregateStatus::BroadcastedUpdate { metrics } => {
@@ -169,7 +279,15 @@ where
                         .await
                         .map_err(BatchSchedulerError::from)?;
                 }
-
+                // Reset round state after completing a broadcast on the primary PS.
+                if Some(peer_id) == primary_ps {
+                    let mut state = round_state.lock().await;
+                    tracing::info!(round = state.round, "Broadcast completed; advancing round");
+                    state.sent_updates.clear();
+                    state.first_update_at = None;
+                    state.round = state.round.saturating_add(1);
+                    tracing::info!(round = state.round, "Next round started");
+                }
                 ExecutorAction::Aggregate(AggregateAction::Idle {
                     timeout: now + Duration::from_secs(1),
                 })
@@ -205,6 +323,8 @@ impl BatchScheduler {
         worker_pool: PoolStatisticsHandle<T>,
         parameter_pool: PoolHandle,
         id: Uuid,
+        min_quorum: usize,
+        grace: Duration,
     ) -> Result<(mpsc::Receiver<(PeerId, Metrics)>, JoinHandle<()>), BatchSchedulerError>
     where
         T: RuntimeStatistic + 'static,
@@ -216,6 +336,14 @@ impl BatchScheduler {
         let stream_handle = tokio::spawn({
             let worker_pool = worker_pool.clone();
             let parameter_pool = parameter_pool.clone();
+            // NOTE: Track per-round SentUpdate signals to decide when to trigger aggregation.
+            let round_state = Arc::new(Mutex::new(RoundState {
+                sent_updates: HashSet::new(),
+                first_update_at: None,
+                min_quorum,
+                grace,
+                round: 0,
+            }));
             network
                 .on::<action::Codec, _>(move |req: &action::ActionRequest| {
                     matches!(
@@ -231,8 +359,16 @@ impl BatchScheduler {
                     let tx = tx.clone();
                     let worker_pool = worker_pool.clone();
                     let parameter_pool = parameter_pool.clone();
+                    let round_state = round_state.clone();
                     async move {
-                        match schedule::<T, S>(tx, worker_pool, parameter_pool, start, request)
+                        match schedule::<T, S>(
+                            tx,
+                            worker_pool,
+                            parameter_pool,
+                            round_state,
+                            start,
+                            request,
+                        )
                             .await
                         {
                             Ok(response) => response,
@@ -268,7 +404,7 @@ mod batch_scheduler_tests {
     use tokio::time::Duration;
     use uuid::Uuid;
 
-    use super::schedule;
+    use super::{schedule, RoundState};
     use crate::{
         allocator::{Allocator, AllocatorError},
         pool::{Pool, PoolConfig, PoolWithStatistics},
@@ -327,10 +463,12 @@ mod batch_scheduler_tests {
         let parameter_pool = ps_pool.handle();
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<(PeerId, Metrics)>(1);
+        let round = std::sync::Arc::new(tokio::sync::Mutex::new(RoundState::default()));
         let resp = schedule::<RunningMean, BasicSimulation>(
             tx,
             worker_handle,
             parameter_pool,
+            round,
             std::time::Instant::now(),
             (
                 PeerId::random(),
@@ -384,10 +522,12 @@ mod batch_scheduler_tests {
         let parameter_pool = ps_pool.handle();
 
         let (tx, _rx) = tokio::sync::mpsc::channel::<(PeerId, Metrics)>(1);
+        let round = std::sync::Arc::new(tokio::sync::Mutex::new(RoundState::default()));
         let resp = schedule::<RunningMean, BasicSimulation>(
             tx,
             worker_handle,
             parameter_pool,
+            round,
             std::time::Instant::now(),
             (
                 PeerId::random(),

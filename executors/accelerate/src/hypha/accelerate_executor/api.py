@@ -18,9 +18,12 @@ class Session(AbstractContextManager["Session", None]):
     ) -> None:
         self._client.close()
 
-    def send_resource(self, resource: Any, path: str) -> None:
-        req = {"resource": resource, "path": path}
-        _ = self._client.post("http://hypha/resources/send", json=req, timeout=None).raise_for_status()
+    def send_resource(self, resource: Any, path: str, timeout: float | None = None) -> None:
+        timeout_ms = int(timeout * 1000) if timeout is not None else None
+        req = {"resource": resource, "path": path, "timeout_ms": timeout_ms}
+        # We must allow the client to wait at least as long as the requested timeout.
+        # If timeout is None, wait forever.
+        _ = self._client.post("http://hypha/resources/send", json=req, timeout=timeout).raise_for_status()
 
     def send_action(self, payload: Any) -> Any:
         resp = self._client.post("http://hypha/action/update", json=payload, timeout=None).raise_for_status()
@@ -33,12 +36,16 @@ class Session(AbstractContextManager["Session", None]):
     @contextmanager
     def receive(self, resource: Any, path: str, timeout: float | None = None) -> Iterator["EventSource"]:
         req = {"resource": resource, "path": path}
+        # Use a short connect timeout to fail fast if the local side is unresponsive,
+        # but respect the provided timeout for the total duration/read.
+        # If timeout is None, we still enforce a connect timeout.
+        timeout_config = httpx.Timeout(timeout, connect=5.0)
         with self._client.stream(
             "POST",
             "http://hypha/resources/receive",
             json=req,
             headers={"Accept": "text/event-stream"},
-            timeout=timeout,
+            timeout=timeout_config,
         ) as resp:
             yield EventSource(resp)
 

@@ -10,7 +10,7 @@ use std::{
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use arc_swap::ArcSwap;
@@ -39,6 +39,12 @@ use crate::{
 pub struct WorkerDescriptor {
     pub peer_id: PeerId,
     pub resources: Resources,
+    /// Join timestamp used for deterministic ordering of pool members.
+    ///
+    /// NOTE: We keep this to ensure stable, oldest-first ordering of the
+    /// member list exposed via `Pool::members()`. This prevents incidental
+    /// reordering due to allocation batch order or concurrent joins.
+    pub joined_at: SystemTime,
 }
 
 impl Display for WorkerDescriptor {
@@ -95,6 +101,10 @@ impl From<&Worker> for WorkerDescriptor {
         Self {
             peer_id: worker.peer_id(),
             resources: *worker.resources(),
+            // NOTE: Use the time of insertion into the pool as the join time
+            // to provide a stable ordering for routing decisions that rely
+            // on picking the "oldest" member.
+            joined_at: SystemTime::now(),
         }
     }
 }
@@ -338,6 +348,22 @@ where
                                         (peer_id, result)
                                     }));
                                 }
+
+                                // NOTE: Ensure deterministic, oldest-first ordering by join time.
+                                // This keeps routing decisions stable across concurrent joins
+                                // and allocator return order.
+                                //
+                                // QUESTION: Should we consider a tiebreaker? `SystemTime` has
+                                // sufficient granularity here and is assigned per insertion, so
+                                // ties are highly unlikely. If needed we could add a peer_id
+                                // secondary key.
+                                // NOTE: Ensure deterministic, oldest-first ordering by join time
+                                // with a `peer_id` tiebreaker for strict total ordering.
+                                members_snapshot.sort_by(|a, b| {
+                                    a.joined_at
+                                        .cmp(&b.joined_at)
+                                        .then_with(|| a.peer_id.to_bytes().cmp(&b.peer_id.to_bytes()))
+                                });
 
                                 // NOTE: Store updated membership before emitting descriptors on
                                 // the stream to maintain consistency.

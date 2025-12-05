@@ -414,6 +414,8 @@ async fn run(config: ConfigWithMetadata<Config>) -> Result<()> {
         worker_handle.clone(),
         parameter_handle.clone(),
         job_id,
+        diloco_config.resources.worker_pool.min as usize,
+        Duration::from_millis(diloco_config.resources.worker_pool.grace_ms),
     )
     .await
     .into_diagnostic()?;

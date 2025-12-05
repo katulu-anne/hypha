@@ -104,6 +104,8 @@ def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR09
             action = next_action.get("action", {})
             kind = action.get("kind")
 
+            print(f"Action: {kind}", flush=True)
+
             if kind == "terminate":
                 print("Training finished", flush=True)
                 break
@@ -164,8 +166,14 @@ def main(socket_path: str, work_dir: str, job_json: str) -> None:  # noqa: PLR09
                         },
                     }
                     continue
+
+                timeout_ms = system_time_to_epoch_ms(action.get("timeout"))
+                timeout_sec = (timeout_ms - int(time.time() * 1000.0)) / 1000.0 if timeout_ms else None
+                if timeout_sec is not None and timeout_sec < 1.0:
+                    timeout_sec = 1.0
+
                 try:
-                    session.send_resource(target, last_gradient)
+                    session.send_resource(target, last_gradient, timeout=timeout_sec)
                     current_status = {"executor": "train", "details": {"state": "sent-update"}}
                 except Exception as exc:  # noqa: BLE001
                     current_status = {
